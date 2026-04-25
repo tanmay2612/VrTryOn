@@ -6,7 +6,13 @@ const connectDB = require("./config/db");
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    "http://localhost:3000",
+    "https://vrtryon-frontend.onrender.com"
+  ]
+}));
+
 app.use(express.json());
 
 let db;
@@ -65,7 +71,9 @@ app.post("/api/users", async (req, res) => {
   }
 });
 
-// Start server
-app.listen(5000, () => {
-  console.log("🚀 Server running on port 5000");
+// ✅ FIXED PORT
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
