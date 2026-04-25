@@ -1,4 +1,4 @@
-const BASE_URL = "http://localhost:5000";
+const BASE_URL = "https://vrtryon-backend.onrender.com";
 
 export async function getUsers() {
   const res = await fetch(`${BASE_URL}/api/users`);
