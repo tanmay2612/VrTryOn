@@ -49,7 +49,7 @@ VrTryOn/
 
 1. Clone the repository
 
-git clone https://github.com/tanmay2612/VrTryOn.git
+git clone https://github.com/suyashverma16/VrTryOn.git
 cd VrTryOn
 
 2. Run Backend
