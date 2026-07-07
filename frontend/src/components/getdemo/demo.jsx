@@ -2,10 +2,13 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Pose } from "@mediapipe/pose";
 import { Camera } from "@mediapipe/camera_utils";
 
-// ─── Smoothing helper ────────────────────────────────────────────────────────
+// ─── small helpers ───────────────────────────────────────────────────────────
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
 // Exponential smoothing per-value (position, size, angle) instead of one
-// shared value. Smoothing each independently keeps the shirt from jittering
-// while still tracking body movement responsively.
+// shared value, so the shirt tracks the body without jittering.
 function useSmoothRef(factor = 0.75) {
   const ref = useRef(null);
   const smooth = useCallback(
@@ -22,7 +25,6 @@ function useSmoothRef(factor = 0.75) {
   return smooth;
 }
 
-// ─── Angle between shoulders, normalized to (-90°, 90°] ─────────────────────
 function shoulderAngle(left, right) {
   let angle = Math.atan2(right.y - left.y, right.x - left.x);
   if (angle > Math.PI / 2) angle -= Math.PI;
@@ -32,8 +34,8 @@ function shoulderAngle(left, right) {
 
 // ─── Draw the garment warped onto a 4-point quad ────────────────────────────
 // Splitting the quad into two triangles and solving the affine transform for
-// each lets the shirt tilt/shear with the shoulders instead of just being a
-// straight, rotated rectangle — this is what makes it "drape" realistically.
+// each lets the shirt tilt/shear with the shoulders instead of being a
+// straight, rigidly-rotated rectangle.
 function drawWarpedCloth(ctx, img, corners) {
   if (!img || !img.complete || img.naturalWidth === 0) return;
 
@@ -82,7 +84,8 @@ function drawWarpedCloth(ctx, img, corners) {
   }
 }
 
-// ─── Subtle shading so the flat png doesn't look pasted on ──────────────────
+// Subtle shading so the flat png doesn't look pasted on: highlight near the
+// collar, soft shadow toward the hem.
 function drawLightingOverlay(ctx, corners, alpha = 0.15) {
   const [tl, tr, br, bl] = corners;
   const midTopX = (tl.x + tr.x) / 2;
@@ -108,10 +111,26 @@ function drawLightingOverlay(ctx, corners, alpha = 0.15) {
   ctx.restore();
 }
 
+function quadPath(ctx, corners) {
+  const [tl, tr, br, bl] = corners;
+  ctx.beginPath();
+  ctx.moveTo(tl.x, tl.y);
+  ctx.lineTo(tr.x, tr.y);
+  ctx.lineTo(br.x, br.y);
+  ctx.lineTo(bl.x, bl.y);
+  ctx.closePath();
+}
+
 export default function VirtualTryOn() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const clothRef = useRef(null);
+
+  // Persistent offscreen canvases reused every frame (avoid re-allocating).
+  const clothLayerRef = useRef(null); // rendered garment + shading + tint
+  const maskLayerRef = useRef(null); // feathered alpha mask for soft edges
+  if (!clothLayerRef.current) clothLayerRef.current = document.createElement("canvas");
+  if (!maskLayerRef.current) maskLayerRef.current = document.createElement("canvas");
 
   const [type, setType] = useState("shirt");
   const [index, setIndex] = useState(0);
@@ -128,6 +147,7 @@ export default function VirtualTryOn() {
   const smoothW = useSmoothRef(0.75);
   const smoothH = useSmoothRef(0.75);
   const smoothA = useSmoothRef(0.85);
+  const smoothNeckY = useSmoothRef(0.8);
 
   useEffect(() => {
     const pose = new Pose({
@@ -166,19 +186,12 @@ export default function VirtualTryOn() {
 
       ctx.clearRect(0, 0, W, H);
 
-      // Draw the mirrored (selfie-view) camera feed, then IMMEDIATELY restore
-      // the transform. Everything drawn after this point uses plain,
-      // un-flipped canvas coordinates.
-      //
-      // The previous version kept the ctx.scale(-1, 1) flip active while also
-      // rotating the shirt with ctx.rotate(angle). A rotation performed inside
-      // a horizontally-mirrored context spins in the OPPOSITE visual
-      // direction, so whenever the person tilted their shoulders the shirt
-      // tilted the wrong way relative to their mirrored body — that was the
-      // core "alignment" bug. Restoring right after drawing the video avoids
-      // that trap entirely: we mirror the landmark X coordinates ourselves
-      // (mirroredX = (1 - x) * W) and do all subsequent math/drawing in a
-      // normal, non-flipped coordinate space.
+      // Draw the mirrored (selfie-view) camera feed, then restore the
+      // transform immediately. Everything after this uses plain, un-flipped
+      // canvas coordinates — we mirror landmark X ourselves instead of
+      // keeping the ctx flip active (rotating inside an active horizontal
+      // flip spins the visual result the wrong way, which was the original
+      // alignment bug).
       ctx.save();
       ctx.translate(W, 0);
       ctx.scale(-1, 1);
@@ -195,8 +208,10 @@ export default function VirtualTryOn() {
       const rs = lm[12]; // right shoulder
       const lh = lm[23]; // left hip
       const rh = lm[24]; // right hip
+      const mouthL = lm[9];
+      const mouthR = lm[10];
 
-      if (!ls || !rs || !lh || !rh) {
+      if (!ls || !rs || !lh || !rh || !mouthL || !mouthR) {
         setConfidence(0);
         return;
       }
@@ -213,6 +228,7 @@ export default function VirtualTryOn() {
       const rhX = (1 - rh.x) * W;
       const lhY = lh.y * H;
       const rhY = rh.y * H;
+      const mouthY = ((mouthL.y + mouthR.y) / 2) * H;
 
       const shoulderCX = (lsX + rsX) / 2;
       const hipCX = (lhX + rhX) / 2;
@@ -220,22 +236,76 @@ export default function VirtualTryOn() {
 
       const shoulderCY = (lsY + rsY) / 2;
       const hipCY = (lhY + rhY) / 2;
-      const rawTorsoH = hipCY - shoulderCY;
       const rawShoulderWidth = Math.abs(lsX - rsX);
 
-      // Tuned sizing: the old 2.1x shoulder-width ratio made the shirt look
-      // absurdly wide (draping way past the arms). 1.7x/1.45x reads as a
-      // properly-fitted garment while still covering the shoulders/arms.
-      const SCALE_W = 1.7;
-      const SCALE_H = 1.45;
+      // Close-up framing (as on a laptop webcam) often puts the hips
+      // partly or fully off-screen. MediaPipe still returns a position for
+      // them in that case, but with low confidence, and trusting it can
+      // make the shirt's height unstable frame-to-frame. When hip
+      // visibility is poor, fall back to a fixed torso-height-to-shoulder-
+      // width ratio (a typical body proportion) instead of the shaky
+      // hip-based measurement.
+      const hipVis = (lh.visibility + rh.visibility) / 2;
+      const hipBasedTorsoH = hipCY - shoulderCY;
+      const fallbackTorsoH = rawShoulderWidth * 1.45;
+      const rawTorsoH =
+        hipVis > 0.5
+          ? hipBasedTorsoH
+          : hipVis > 0.15
+          ? hipBasedTorsoH * (hipVis / 0.5) + fallbackTorsoH * (1 - hipVis / 0.5)
+          : fallbackTorsoH;
+
+      // ── Neck / jaw line ─────────────────────────────────────────────────
+      // Pose landmarks don't include the jaw directly, so we approximate the
+      // neck base as a point between the mouth and the shoulder line. This
+      // is what the garment gets clipped against, so it can never render
+      // up over the chin/face regardless of how big the size estimate is.
+      const rawNeckY = mouthY + (shoulderCY - mouthY) * 0.5;
+      const neckY = smoothNeckY(rawNeckY);
+
+      // ── Adaptive sizing ──────────────────────────────────────────────────
+      // A fixed 1.7x/1.45x ratio looked fine at a "standing back" distance
+      // but became oversized up close (webcam close-ups make the shoulder
+      // span a much bigger fraction of the frame). Damp the scale down as
+      // the subject gets closer to the camera.
+      const shoulderFrac = rawShoulderWidth / W;
+      const proximityDamp = clamp(1 - (shoulderFrac - 0.2) * 1.1, 0.7, 1.05);
+
+      // Slightly wider than the raw shoulder-to-shoulder span so the
+      // garment's shoulder seams sit just past the body outline — enough
+      // to cover the collar/fabric of whatever the person is actually
+      // wearing underneath, without ballooning out into the oversized look
+      // from before.
+      const SCALE_W = 1.62 * proximityDamp;
+      const SCALE_H = 1.3 * proximityDamp;
 
       const rawCW = rawShoulderWidth * SCALE_W;
       const rawCH = rawTorsoH * SCALE_H;
 
-      // Collar sits slightly above the shoulder line rather than centered on it.
-      const rawCY = shoulderCY + rawCH * (0.5 - 0.1);
+      // Anchor the collar to the neck line (not an arbitrary shoulder
+      // offset): push the shirt's center down so its top edge sits a bit
+      // ABOVE the neck line — the neck clip (applied later) trims that
+      // excess away, leaving a clean collar edge right at the jaw no matter
+      // how the size estimate above comes out.
+      const rawCY = neckY + rawCH * 0.35;
       const rawCX = torsoCX;
-      const rawAngle = shoulderAngle({ x: lsX, y: lsY }, { x: rsX, y: rsY });
+
+      // Clamp the tilt to a realistic range. A momentary tracking glitch
+      // (e.g. one shoulder landmark briefly drifting due to low
+      // confidence) can otherwise produce an angle near ±90°, which turns
+      // the quad's "width" axis nearly vertical and warps the garment into
+      // a long diagonal sliver instead of a shirt shape.
+      const MAX_TILT = 0.45; // ~26°, generous for someone facing a webcam
+      const rawAngle = clamp(
+        shoulderAngle({ x: lsX, y: lsY }, { x: rsX, y: rsY }),
+        -MAX_TILT,
+        MAX_TILT
+      );
+
+      // If the detected shoulder span is implausibly small relative to the
+      // frame, the landmarks are unreliable this frame (occlusion, partial
+      // view, etc.) — skip drawing rather than render garbage geometry.
+      if (rawShoulderWidth < W * 0.08) return;
 
       const cx = smoothCX(rawCX);
       const cy = smoothCY(rawCY);
@@ -249,8 +319,8 @@ export default function VirtualTryOn() {
       const sinA = Math.sin(angle);
 
       // Top edge follows the shoulder tilt fully; the bottom edge only
-      // partially follows it (a real shirt hangs straighter at the hem due
-      // to gravity), which gives a subtle, more natural drape/perspective.
+      // partially follows it (gravity keeps a real hem hanging straighter),
+      // giving a subtle, more natural drape.
       const topTiltX = halfW * cosA;
       const topTiltY = halfW * sinA;
       const botTiltFactor = 0.3;
@@ -268,20 +338,102 @@ export default function VirtualTryOn() {
       ];
 
       const img = clothRef.current;
-      if (img && img.complete && img.naturalWidth > 0) {
-        ctx.save();
-        ctx.globalAlpha = 0.93; // slight transparency so the body shows through at the edges
-        drawWarpedCloth(ctx, img, corners);
-        drawLightingOverlay(ctx, corners, 0.14);
-        ctx.restore();
+      if (!(img && img.complete && img.naturalWidth > 0)) return;
+
+      // ── Sample ambient light from the video right where the collar sits ──
+      // so the garment can be tinted toward the room's actual lighting
+      // instead of keeping its own flat studio-photo color.
+      let tintColor = null;
+      try {
+        const sx = Math.round(clamp(cx, 2, W - 2));
+        const sy = Math.round(clamp(topEdgeY - 8, 2, H - 2));
+        const px = ctx.getImageData(sx, sy, 1, 1).data;
+        tintColor = `rgba(${px[0]}, ${px[1]}, ${px[2]}, 0.12)`;
+      } catch (e) {
+        tintColor = null; // canvas tainted (rare) — skip tinting for this frame
       }
+
+      // ── Render the garment (shaded + tinted) onto an offscreen layer ─────
+      const cloth = clothLayerRef.current;
+      cloth.width = W;
+      cloth.height = H;
+      const cctx = cloth.getContext("2d");
+      cctx.clearRect(0, 0, W, H);
+
+      cctx.save();
+      cctx.filter = "blur(1px)"; // softens the crisp studio-photo edge slightly
+      drawWarpedCloth(cctx, img, corners);
+      cctx.restore();
+
+      drawLightingOverlay(cctx, corners, 0.14);
+
+      if (tintColor) {
+        cctx.save();
+        cctx.globalCompositeOperation = "overlay";
+        cctx.fillStyle = tintColor;
+        quadPath(cctx, corners);
+        cctx.fill();
+        cctx.restore();
+      }
+
+      // ── Feather the garment's edges ───────────────────────────────────────
+      // A hard-edged cutout is the biggest single tell that a shirt is
+      // "pasted on". Build a blurred alpha mask of the same quad and use it
+      // to fade the garment's own edges before compositing.
+      const mask = maskLayerRef.current;
+      mask.width = W;
+      mask.height = H;
+      const mctx = mask.getContext("2d");
+      mctx.clearRect(0, 0, W, H);
+      mctx.save();
+      mctx.filter = "blur(7px)";
+      mctx.fillStyle = "#fff";
+      quadPath(mctx, corners);
+      mctx.fill();
+      mctx.restore();
+
+      cctx.save();
+      cctx.globalCompositeOperation = "destination-in";
+      cctx.drawImage(mask, 0, 0);
+      cctx.restore();
+
+      // ── Composite onto the main canvas ────────────────────────────────────
+      ctx.save();
+
+      // Clip to a curved neckline so the shirt can never appear above the
+      // jaw, whatever the size estimate does.
+      const collarHalf = rawShoulderWidth * 0.22;
+      const leftPtX = clamp(cx - collarHalf, 0, W);
+      const rightPtX = clamp(cx + collarHalf, 0, W);
+      const dip = ch * 0.04;
+      ctx.beginPath();
+      ctx.moveTo(0, neckY);
+      ctx.lineTo(leftPtX, neckY);
+      ctx.quadraticCurveTo(cx, neckY + dip, rightPtX, neckY);
+      ctx.lineTo(W, neckY);
+      ctx.lineTo(W, H);
+      ctx.lineTo(0, H);
+      ctx.closePath();
+      ctx.clip();
+
+      // A soft contact shadow, cast from the garment's own alpha silhouette,
+      // grounds it against the neck/shoulders instead of floating on top.
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.32)";
+      ctx.shadowBlur = 9;
+      ctx.shadowOffsetY = 4;
+      ctx.globalAlpha = 0.95;
+      ctx.drawImage(cloth, 0, 0);
+      ctx.restore();
+
+      ctx.restore(); // remove neckline clip
     }
 
     return () => {
       camera.stop();
       pose.close();
     };
-  }, [smoothA, smoothCX, smoothCY, smoothH, smoothW]);
+  }, [smoothA, smoothCX, smoothCY, smoothH, smoothW, smoothNeckY]);
 
   useEffect(() => {
     if (clothRef.current) {
@@ -390,7 +542,13 @@ export default function VirtualTryOn() {
       </div>
 
       {/* Hidden cloth image used as the drawing source */}
-      <img ref={clothRef} src={clothes[type][index]} alt="cloth" style={{ display: "none" }} crossOrigin="anonymous" />
+      <img
+        ref={clothRef}
+        src={clothes[type][index]}
+        alt="cloth"
+        style={{ display: "none" }}
+        crossOrigin="anonymous"
+      />
     </div>
   );
 }
