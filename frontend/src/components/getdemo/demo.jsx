@@ -393,4 +393,3 @@ export default function VirtualTryOn() {
       <img ref={clothRef} src={clothes[type][index]} alt="cloth" style={{ display: "none" }} crossOrigin="anonymous" />
     </div>
   );
-}
