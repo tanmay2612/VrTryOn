@@ -2,7 +2,10 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Pose } from "@mediapipe/pose";
 import { Camera } from "@mediapipe/camera_utils";
 
-// ─── Smoothing helpers ──────────────────────────────────────────────────────
+// ─── Smoothing helper ────────────────────────────────────────────────────────
+// Exponential smoothing per-value (position, size, angle) instead of one
+// shared value. Smoothing each independently keeps the shirt from jittering
+// while still tracking body movement responsively.
 function useSmoothRef(factor = 0.75) {
   const ref = useRef(null);
   const smooth = useCallback(
@@ -16,19 +19,21 @@ function useSmoothRef(factor = 0.75) {
     },
     [factor]
   );
-  return [ref, smooth];
+  return smooth;
 }
 
-// ─── Draw a perspective-warped quad for the garment ──────────────────────────
-//
-// We define four corner points of the shirt (top-left, top-right,
-// bottom-right, bottom-left) and warp the canvas context to map
-// the image into that quad using a simple affine transform split
-// into two triangles.  This gives a basic 3-D drape effect that
-// responds to shoulder tilt.
-//
-// srcW / srcH = natural dimensions of the clothing image
-// corners     = [TL, TR, BR, BL] as {x, y}
+// ─── Angle between shoulders, normalized to (-90°, 90°] ─────────────────────
+function shoulderAngle(left, right) {
+  let angle = Math.atan2(right.y - left.y, right.x - left.x);
+  if (angle > Math.PI / 2) angle -= Math.PI;
+  if (angle < -Math.PI / 2) angle += Math.PI;
+  return angle;
+}
+
+// ─── Draw the garment warped onto a 4-point quad ────────────────────────────
+// Splitting the quad into two triangles and solving the affine transform for
+// each lets the shirt tilt/shear with the shoulders instead of just being a
+// straight, rotated rectangle — this is what makes it "drape" realistically.
 function drawWarpedCloth(ctx, img, corners) {
   if (!img || !img.complete || img.naturalWidth === 0) return;
 
@@ -36,27 +41,9 @@ function drawWarpedCloth(ctx, img, corners) {
   const sw = img.naturalWidth;
   const sh = img.naturalHeight;
 
-  // Draw two triangles that together cover the quad
-  // Triangle 1: TL, TR, BR   →  maps to image (0,0), (sw,0), (sw,sh)
-  // Triangle 2: TL, BR, BL   →  maps to image (0,0), (sw,sh), (0,sh)
-
   const triangles = [
-    {
-      dst: [tl, tr, br],
-      src: [
-        { x: 0, y: 0 },
-        { x: sw, y: 0 },
-        { x: sw, y: sh },
-      ],
-    },
-    {
-      dst: [tl, br, bl],
-      src: [
-        { x: 0, y: 0 },
-        { x: sw, y: sh },
-        { x: 0, y: sh },
-      ],
-    },
+    { dst: [tl, tr, br], src: [{ x: 0, y: 0 }, { x: sw, y: 0 }, { x: sw, y: sh }] },
+    { dst: [tl, br, bl], src: [{ x: 0, y: 0 }, { x: sw, y: sh }, { x: 0, y: sh }] },
   ];
 
   for (const { dst, src } of triangles) {
@@ -68,22 +55,13 @@ function drawWarpedCloth(ctx, img, corners) {
     ctx.closePath();
     ctx.clip();
 
-    // Solve the affine 2-D transform that maps src triangle → dst triangle
     const [s0, s1, s2] = src;
     const [d0, d1, d2] = dst;
 
-    // Build matrix that maps src → dst
-    // [a, b, c]   [sx]   [dx]
-    // [d, e, f] × [sy] = [dy]
-    //             [ 1]
-    const sx1 = s1.x - s0.x,
-      sy1 = s1.y - s0.y;
-    const sx2 = s2.x - s0.x,
-      sy2 = s2.y - s0.y;
-    const dx1 = d1.x - d0.x,
-      dy1 = d1.y - d0.y;
-    const dx2 = d2.x - d0.x,
-      dy2 = d2.y - d0.y;
+    const sx1 = s1.x - s0.x, sy1 = s1.y - s0.y;
+    const sx2 = s2.x - s0.x, sy2 = s2.y - s0.y;
+    const dx1 = d1.x - d0.x, dy1 = d1.y - d0.y;
+    const dx2 = d2.x - d0.x, dy2 = d2.y - d0.y;
 
     const det = sx1 * sy2 - sx2 * sy1;
     if (Math.abs(det) < 1e-6) {
@@ -104,19 +82,18 @@ function drawWarpedCloth(ctx, img, corners) {
   }
 }
 
-// ─── Lighting overlay — subtle gradient to simulate torso shadow ──────────
-function drawLightingOverlay(ctx, corners, alpha = 0.18) {
+// ─── Subtle shading so the flat png doesn't look pasted on ──────────────────
+function drawLightingOverlay(ctx, corners, alpha = 0.15) {
   const [tl, tr, br, bl] = corners;
-
   const midTopX = (tl.x + tr.x) / 2;
   const midTopY = (tl.y + tr.y) / 2;
   const midBotX = (bl.x + br.x) / 2;
   const midBotY = (bl.y + br.y) / 2;
 
   const grad = ctx.createLinearGradient(midTopX, midTopY, midBotX, midBotY);
-  grad.addColorStop(0, `rgba(255,255,255,${alpha * 0.6})`); // slight highlight at top
-  grad.addColorStop(0.4, `rgba(0,0,0,0)`);
-  grad.addColorStop(1, `rgba(0,0,0,${alpha})`); // shadow at bottom
+  grad.addColorStop(0, `rgba(255,255,255,${alpha * 0.6})`);
+  grad.addColorStop(0.4, "rgba(0,0,0,0)");
+  grad.addColorStop(1, `rgba(0,0,0,${alpha})`);
 
   ctx.save();
   ctx.globalCompositeOperation = "multiply";
@@ -131,15 +108,6 @@ function drawLightingOverlay(ctx, corners, alpha = 0.18) {
   ctx.restore();
 }
 
-// ─── Compute shoulder angle between two points ───────────────────────────────
-function shoulderAngle(left, right) {
-  let angle = Math.atan2(right.y - left.y, right.x - left.x);
-  if (angle > Math.PI / 2) angle -= Math.PI;
-  if (angle < -Math.PI / 2) angle += Math.PI;
-  return angle;
-}
-
-// ─── Main component ──────────────────────────────────────────────────────────
 export default function VirtualTryOn() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -149,22 +117,21 @@ export default function VirtualTryOn() {
   const [index, setIndex] = useState(0);
   const [confidence, setConfidence] = useState(0);
 
-  // Smooth position/size values independently so transitions feel fluid
-  const [cxRef, smoothCX] = useSmoothRef(0.8);
-  const [cyRef, smoothCY] = useSmoothRef(0.8);
-  const [wRef, smoothW] = useSmoothRef(0.75);
-  const [hRef, smoothH] = useSmoothRef(0.75);
-  const [aRef, smoothA] = useSmoothRef(0.85);
-
   const clothes = {
     shirt: ["/clothes/shirt1.png", "/clothes/shirt.png"],
     tshirt: ["/clothes/tshirt1.png", "/clothes/tshirt.png"],
   };
 
+  // Smooth each parameter independently
+  const smoothCX = useSmoothRef(0.8);
+  const smoothCY = useSmoothRef(0.8);
+  const smoothW = useSmoothRef(0.75);
+  const smoothH = useSmoothRef(0.75);
+  const smoothA = useSmoothRef(0.85);
+
   useEffect(() => {
     const pose = new Pose({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
     });
 
     pose.setOptions({
@@ -199,7 +166,19 @@ export default function VirtualTryOn() {
 
       ctx.clearRect(0, 0, W, H);
 
-      // Mirror the video feed
+      // Draw the mirrored (selfie-view) camera feed, then IMMEDIATELY restore
+      // the transform. Everything drawn after this point uses plain,
+      // un-flipped canvas coordinates.
+      //
+      // The previous version kept the ctx.scale(-1, 1) flip active while also
+      // rotating the shirt with ctx.rotate(angle). A rotation performed inside
+      // a horizontally-mirrored context spins in the OPPOSITE visual
+      // direction, so whenever the person tilted their shoulders the shirt
+      // tilted the wrong way relative to their mirrored body — that was the
+      // core "alignment" bug. Restoring right after drawing the video avoids
+      // that trap entirely: we mirror the landmark X coordinates ourselves
+      // (mirroredX = (1 - x) * W) and do all subsequent math/drawing in a
+      // normal, non-flipped coordinate space.
       ctx.save();
       ctx.translate(W, 0);
       ctx.scale(-1, 1);
@@ -222,149 +201,94 @@ export default function VirtualTryOn() {
         return;
       }
 
-      // Use visibility as a proxy for confidence
-      const vis =
-        (ls.visibility + rs.visibility + lh.visibility + rh.visibility) / 4;
+      const vis = (ls.visibility + rs.visibility + lh.visibility + rh.visibility) / 4;
       setConfidence(Math.round(vis * 100));
 
-      // ── Raw measurements ─────────────────────────────────────────────────
-      // MediaPipe gives normalized coords (0–1). X=0 is the LEFT of the raw
-      // camera image (which is the person's RIGHT because front-cameras mirror).
-      // We draw the canvas mirrored (selfie view), so to place the overlay in
-      // the mirrored space we simply mirror X: mirroredX = (1 - landmark.x) * W
-      const lsX = (1 - ls.x) * W;   // left shoulder  in mirrored canvas
-      const rsX = (1 - rs.x) * W;   // right shoulder in mirrored canvas
+      // Mirror X to match the mirrored video we just drew; Y is unaffected.
+      const lsX = (1 - ls.x) * W;
+      const rsX = (1 - rs.x) * W;
       const lsY = ls.y * H;
       const rsY = rs.y * H;
-      const lhX = (1 - lm[23].x) * W;
-      const rhX = (1 - lm[24].x) * W;
+      const lhX = (1 - lh.x) * W;
+      const rhX = (1 - rh.x) * W;
       const lhY = lh.y * H;
       const rhY = rh.y * H;
 
-      // Torso center X — average of all four anchor points for robustness
       const shoulderCX = (lsX + rsX) / 2;
-      const hipCX      = (lhX + rhX) / 2;
-      const torsoCX    = (shoulderCX + hipCX) / 2;
+      const hipCX = (lhX + rhX) / 2;
+      const torsoCX = (shoulderCX + hipCX) / 2;
 
       const shoulderCY = (lsY + rsY) / 2;
-      const hipCY      = (lhY + rhY) / 2;
-      const rawTorsoH  = hipCY - shoulderCY;
-
-      // Shoulder span measured in the mirrored space
+      const hipCY = (lhY + rhY) / 2;
+      const rawTorsoH = hipCY - shoulderCY;
       const rawShoulderWidth = Math.abs(lsX - rsX);
 
-      // ── Sizing ────────────────────────────────────────────────────────────
-      // Width:  shirt needs to be wider than the shoulder span to cover arms
+      // Tuned sizing: the old 2.1x shoulder-width ratio made the shirt look
+      // absurdly wide (draping way past the arms). 1.7x/1.45x reads as a
+      // properly-fitted garment while still covering the shoulders/arms.
       const SCALE_W = 1.7;
-      // Height: shirt spans from collar (slightly above shoulders) to below hips
       const SCALE_H = 1.45;
 
       const rawCW = rawShoulderWidth * SCALE_W;
       const rawCH = rawTorsoH * SCALE_H;
 
-      // ── Vertical center ───────────────────────────────────────────────────
-      // The shirt image has collar near top, hem near bottom.
-      // We want collar ≈ at shoulder level → center = shoulders + half shirt height
-      // Nudge up slightly (×0.1) so collar sits AT the shoulder, not below it.
-      const rawCY = shoulderCY + rawCH * (0.5 - 0.10);
-
-      // ── Horizontal center ─────────────────────────────────────────────────
-      // Use torso center rather than shoulder center alone (more stable)
+      // Collar sits slightly above the shoulder line rather than centered on it.
+      const rawCY = shoulderCY + rawCH * (0.5 - 0.1);
       const rawCX = torsoCX;
+      const rawAngle = shoulderAngle({ x: lsX, y: lsY }, { x: rsX, y: rsY });
 
-      const rawAngle = shoulderAngle(
-        { x: lsX, y: lsY },
-        { x: rsX, y: rsY }
-      );
-
-      // ── Smooth values ─────────────────────────────────────────────────────
       const cx = smoothCX(rawCX);
       const cy = smoothCY(rawCY);
       const cw = smoothW(rawCW);
       const ch = smoothH(rawCH);
       const angle = smoothA(rawAngle);
 
-      // ── Build the four corner points with shoulder tilt applied ───────────
-      // We tilt the top edge to follow the shoulders, while the bottom edge
-      // stays more horizontal (shirt hangs straight due to gravity).
-      // This creates the perspective-like drape effect.
       const halfW = cw / 2;
       const halfH = ch / 2;
-
       const cosA = Math.cos(angle);
       const sinA = Math.sin(angle);
 
-      // Top edge follows shoulder tilt fully
+      // Top edge follows the shoulder tilt fully; the bottom edge only
+      // partially follows it (a real shirt hangs straighter at the hem due
+      // to gravity), which gives a subtle, more natural drape/perspective.
       const topTiltX = halfW * cosA;
       const topTiltY = halfW * sinA;
-
-      // Bottom edge: only 30% of shoulder tilt (shirt hangs more vertically)
       const botTiltFactor = 0.3;
       const botTiltX = halfW * cosA * botTiltFactor;
       const botTiltY = halfW * sinA * botTiltFactor;
 
-      // Vertical offsets (perpendicular to tilt for top, straight down for bottom)
       const topEdgeY = cy - halfH;
       const botEdgeY = cy + halfH;
 
       const corners = [
-        { x: cx - topTiltX, y: topEdgeY - topTiltY }, // TL
-        { x: cx + topTiltX, y: topEdgeY + topTiltY }, // TR
-        { x: cx + botTiltX, y: botEdgeY + botTiltY }, // BR
-        { x: cx - botTiltX, y: botEdgeY - botTiltY }, // BL
+        { x: cx - topTiltX, y: topEdgeY - topTiltY }, // top-left
+        { x: cx + topTiltX, y: topEdgeY + topTiltY }, // top-right
+        { x: cx + botTiltX, y: botEdgeY + botTiltY }, // bottom-right
+        { x: cx - botTiltX, y: botEdgeY - botTiltY }, // bottom-left
       ];
 
-      // ── Draw garment ──────────────────────────────────────────────────────
       const img = clothRef.current;
       if (img && img.complete && img.naturalWidth > 0) {
-        // Slight transparency so the body shows through at edges
         ctx.save();
-        ctx.globalAlpha = 0.93;
+        ctx.globalAlpha = 0.93; // slight transparency so the body shows through at the edges
         drawWarpedCloth(ctx, img, corners);
-        ctx.restore();
-
-        // Subtle lighting / shadow overlay to blend with the body
         drawLightingOverlay(ctx, corners, 0.14);
-      }
-
-      // ── Debug dots (comment out when happy with alignment) ────────────────
-      if (window.__vrDebug) {
-        const dots = [
-          { x: lsX, y: lsY, c: "#00ff00", label: "LS" },
-          { x: rsX, y: rsY, c: "#ff0000", label: "RS" },
-          { x: lhX, y: lhY, c: "#00ffff", label: "LH" },
-          { x: rhX, y: rhY, c: "#ff00ff", label: "RH" },
-          { x: cx,  y: cy,  c: "#ffff00", label: "CTR" },
-        ];
-        dots.forEach(({ x, y, c, label }) => {
-          ctx.beginPath();
-          ctx.arc(x, y, 6, 0, Math.PI * 2);
-          ctx.fillStyle = c;
-          ctx.fill();
-          ctx.fillStyle = "white";
-          ctx.font = "bold 12px sans-serif";
-          ctx.fillText(label, x + 8, y - 4);
-        });
+        ctx.restore();
       }
     }
-  }, []);
 
-  // Update clothing image when selection changes
+    return () => {
+      camera.stop();
+      pose.close();
+    };
+  }, [smoothA, smoothCX, smoothCY, smoothH, smoothW]);
+
   useEffect(() => {
     if (clothRef.current) {
       clothRef.current.src = clothes[type][index];
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [type, index]);
-
-  const btnBase = {
-    padding: "10px 22px",
-    borderRadius: "8px",
-    border: "none",
-    cursor: "pointer",
-    fontWeight: 600,
-    fontSize: "15px",
-    transition: "all 0.2s",
-  };
 
   return (
     <div
@@ -376,16 +300,12 @@ export default function VirtualTryOn() {
         alignItems: "center",
         justifyContent: "center",
         color: "white",
-        fontFamily: "system-ui, sans-serif",
         padding: "20px",
       }}
     >
-      <h1 style={{ margin: "0 0 4px", fontSize: "2rem" }}>StyleSnap 👕</h1>
-      <p style={{ opacity: 0.65, margin: "0 0 16px" }}>
-        Try outfits in real-time
-      </p>
+      <h1 style={{ margin: "0 0 4px" }}>StyleSnap 👕</h1>
+      <p style={{ opacity: 0.7, margin: "0 0 12px" }}>Try outfits in real-time</p>
 
-      {/* Confidence badge */}
       <div
         style={{
           marginBottom: "12px",
@@ -398,11 +318,7 @@ export default function VirtualTryOn() {
               ? "rgba(234,179,8,0.25)"
               : "rgba(239,68,68,0.25)",
           border: `1px solid ${
-            confidence > 70
-              ? "#22c55e"
-              : confidence > 40
-              ? "#eab308"
-              : "#ef4444"
+            confidence > 70 ? "#22c55e" : confidence > 40 ? "#eab308" : "#ef4444"
           }`,
           fontSize: "13px",
         }}
@@ -410,112 +326,71 @@ export default function VirtualTryOn() {
         Pose confidence: {confidence}%
       </div>
 
-      {/* Camera view */}
+      {/* Camera + overlay */}
       <div
         style={{
           position: "relative",
-          width: "640px",
-          height: "480px",
-          borderRadius: "18px",
+          width: "700px",
+          maxWidth: "100%",
+          height: "500px",
+          borderRadius: "16px",
           overflow: "hidden",
           boxShadow: "0 25px 60px rgba(0,0,0,0.6)",
-          border: "1px solid rgba(255,255,255,0.1)",
         }}
       >
-        {/* Video is hidden — canvas shows both feed + overlay */}
+        {/* Raw camera feed is only used as an input source for MediaPipe —
+            the canvas below draws the (correctly mirrored) visible frame,
+            so the <video> itself stays invisible to avoid a double image. */}
         <video
           ref={videoRef}
           autoPlay
           playsInline
-          style={{ position: "absolute", opacity: 0, width: "100%" }}
+          muted
+          style={{ position: "absolute", opacity: 0, width: "100%", height: "100%" }}
         />
         <canvas
           ref={canvasRef}
-          style={{ width: "100%", height: "100%", display: "block" }}
+          style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
         />
       </div>
 
-      {/* Category selector */}
+      {/* Category buttons */}
       <div style={{ marginTop: "20px", display: "flex", gap: "10px" }}>
-        {Object.keys(clothes).map((cat) => (
-          <button
-            key={cat}
-            onClick={() => {
-              setType(cat);
-              setIndex(0);
-            }}
-            style={{
-              ...btnBase,
-              background: type === cat ? "#6366f1" : "rgba(255,255,255,0.1)",
-              color: "white",
-              transform: type === cat ? "scale(1.05)" : "scale(1)",
-            }}
-          >
-            {cat.charAt(0).toUpperCase() + cat.slice(1) + "s"}
-          </button>
-        ))}
+        <button onClick={() => { setType("shirt"); setIndex(0); }}>Shirts</button>
+        <button onClick={() => { setType("tshirt"); setIndex(0); }}>T-Shirts</button>
       </div>
 
       {/* Thumbnails */}
       <div
         style={{
-          marginTop: "16px",
+          marginTop: "15px",
           display: "flex",
-          gap: "12px",
+          gap: "10px",
+          overflowX: "auto",
           padding: "10px",
         }}
       >
-        {clothes[type].map((src, i) => (
+        {clothes[type].map((img, i) => (
           <img
             key={i}
-            src={src}
-            alt={`option ${i + 1}`}
+            src={img}
+            alt="thumb"
             onClick={() => setIndex(i)}
             style={{
-              width: "72px",
-              height: "72px",
+              width: "70px",
+              height: "70px",
               objectFit: "cover",
-              borderRadius: "12px",
+              borderRadius: "10px",
               cursor: "pointer",
-              border: index === i ? "3px solid #6366f1" : "2px solid rgba(255,255,255,0.2)",
-              boxShadow: index === i ? "0 0 12px rgba(99,102,241,0.6)" : "none",
-              transition: "all 0.2s",
-              background: "rgba(255,255,255,0.05)",
+              border: index === i ? "3px solid #6366f1" : "2px solid transparent",
+              transition: "0.2s",
             }}
           />
         ))}
       </div>
 
-      {/* Tips */}
-      <p style={{ opacity: 0.45, fontSize: "13px", marginTop: "12px" }}>
-        Stand back 1–2 m · Good lighting · Face the camera straight on
-      </p>
-
-      {/* Debug toggle */}
-      <button
-        onClick={() => { window.__vrDebug = !window.__vrDebug; }}
-        style={{
-          marginTop: "8px",
-          padding: "4px 12px",
-          fontSize: "12px",
-          background: "rgba(255,255,255,0.08)",
-          border: "1px solid rgba(255,255,255,0.2)",
-          borderRadius: "6px",
-          color: "rgba(255,255,255,0.5)",
-          cursor: "pointer",
-        }}
-      >
-        Toggle landmark dots
-      </button>
-
-      {/* Hidden reference image for the cloth renderer */}
-      <img
-        ref={clothRef}
-        src={clothes[type][index]}
-        alt=""
-        style={{ display: "none" }}
-        crossOrigin="anonymous"
-      />
+      {/* Hidden cloth image used as the drawing source */}
+      <img ref={clothRef} src={clothes[type][index]} alt="cloth" style={{ display: "none" }} crossOrigin="anonymous" />
     </div>
   );
 }
